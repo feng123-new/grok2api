@@ -22,6 +22,7 @@ import (
 
 type webMediaUpstreamError struct {
 	status              int
+	retryAfter          time.Duration
 	summary             string
 	bodyBytes           int
 	bodyTruncated       bool
@@ -42,6 +43,13 @@ func (e *webMediaUpstreamError) HTTPStatusCode() int {
 		return 0
 	}
 	return e.status
+}
+
+func (e *webMediaUpstreamError) RetryAfterDuration() time.Duration {
+	if e == nil {
+		return 0
+	}
+	return e.retryAfter
 }
 
 // isClearanceRefreshableMediaError distinguishes browser-session challenges
@@ -119,6 +127,12 @@ func newWebMediaUpstreamError(status int, body []byte, truncated bool) *webMedia
 	}
 }
 
+func newWebMediaUpstreamErrorWithRetryAfter(status int, body []byte, truncated bool, retryAfter time.Duration) *webMediaUpstreamError {
+	upstreamErr := newWebMediaUpstreamError(status, body, truncated)
+	upstreamErr.retryAfter = max(0, retryAfter)
+	return upstreamErr
+}
+
 func classifyWebMediaDiagnosticBody(body []byte) string {
 	if !utf8.Valid(body) {
 		return "binary"
@@ -157,6 +171,7 @@ func (a *Adapter) logWebMediaUpstreamRejection(stage string, response *http.Resp
 	attributes := []any{
 		"stage", stage,
 		"status", upstreamErr.status,
+		"retry_after", upstreamErr.retryAfter,
 		"body_bytes_captured", upstreamErr.bodyBytes,
 		"body_truncated", upstreamErr.bodyTruncated,
 		"body_prefix_sha256", upstreamErr.bodyPrefixSHA256,
@@ -364,7 +379,8 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 		if truncated {
 			body = body[:webMediaDiagnosticBodyLimit]
 		}
-		return provider.VideoResult{}, "", newWebMediaUpstreamError(response.StatusCode, body, truncated)
+		retryAfter := provider.ParseRetryAfterHeader(response.Header.Get("Retry-After"), time.Now().UTC())
+		return provider.VideoResult{}, "", newWebMediaUpstreamErrorWithRetryAfter(response.StatusCode, body, truncated, retryAfter)
 	}
 	var result provider.VideoResult
 	var postID string

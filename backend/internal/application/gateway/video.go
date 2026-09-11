@@ -638,6 +638,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		stage, hasStage := provider.VideoErrorStage(err)
 		safeCreateFailure := hasStage && stage == provider.VideoStageCreate
 		status, hasStatus := provider.ErrorHTTPStatus(err)
+		retryAfter := provider.ErrorRetryAfter(err)
 		if errors.Is(err, provider.ErrUnauthorized) {
 			if lease.Credential.AuthType == account.AuthTypeSSO {
 				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
@@ -669,12 +670,12 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				failureHandled = true
 				retriableCreate = safeCreateFailure && !account.IsBuildSuper(lease.Credential, lease.Billing)
 			case (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && lease.QuotaMode != "":
-				state, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
-				s.applyRateLimitReconciliation(failureCtx, lease.Credential, status, 0, state, reconcileErr)
+				state, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, retryAfter)
+				s.applyRateLimitReconciliation(failureCtx, lease.Credential, status, retryAfter, state, reconcileErr)
 				failureHandled = true
 				retriableCreate = safeCreateFailure
 			case status == http.StatusTooManyRequests || status == http.StatusPaymentRequired:
-				s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
+				s.selector.MarkFailure(failureCtx, lease.Credential, status, retryAfter)
 				failureHandled = true
 				retriableCreate = safeCreateFailure
 			case status >= http.StatusInternalServerError:

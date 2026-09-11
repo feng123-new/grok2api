@@ -741,10 +741,11 @@ func TestVideoAttemptPolicyStandaloneAndUnlimited(t *testing.T) {
 }
 
 type videoCreateFailoverAdapter struct {
-	mu       sync.Mutex
-	failures map[uint64]int
-	status   int
-	attempts []uint64
+	mu         sync.Mutex
+	failures   map[uint64]int
+	status     int
+	retryAfter time.Duration
+	attempts   []uint64
 }
 
 func (a *videoCreateFailoverAdapter) Provider() account.Provider { return account.ProviderWeb }
@@ -767,7 +768,7 @@ func (a *videoCreateFailoverAdapter) GenerateVideo(_ context.Context, request pr
 		if a.status == 0 {
 			return provider.VideoResult{}, errors.New("unclassified create failure")
 		}
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStageCreate, a.status, videoHTTPStatusError{status: a.status})
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStageCreate, a.status, videoHTTPStatusError{status: a.status, retryAfter: a.retryAfter})
 	}
 	return provider.VideoResult{AssetID: "video_asset_00001", ContentType: "video/mp4"}, nil
 }
@@ -778,10 +779,14 @@ func (a *videoCreateFailoverAdapter) Attempts() []uint64 {
 	return append([]uint64(nil), a.attempts...)
 }
 
-type videoHTTPStatusError struct{ status int }
+type videoHTTPStatusError struct {
+	status     int
+	retryAfter time.Duration
+}
 
-func (e videoHTTPStatusError) Error() string       { return http.StatusText(e.status) }
-func (e videoHTTPStatusError) HTTPStatusCode() int { return e.status }
+func (e videoHTTPStatusError) Error() string                     { return http.StatusText(e.status) }
+func (e videoHTTPStatusError) HTTPStatusCode() int               { return e.status }
+func (e videoHTTPStatusError) RetryAfterDuration() time.Duration { return e.retryAfter }
 
 func TestVideoWebForbiddenRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
 	ctx := context.Background()
@@ -898,5 +903,87 @@ func TestVideoWebForbiddenRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
 	}
 	if stored.Status != media.StatusFailed || stored.AccountID != first.ID {
 		t.Fatalf("unclassified failed job = %#v", stored)
+	}
+}
+
+func TestVideo429UsesRetryAfterForAccountCooldown(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-retry-after.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	mediaRepo := relational.NewMediaJobRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+		Name: "retry-after", SourceKey: "retry-after", EncryptedAccessToken: "retry-after-token",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
+		Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderWeb, []string{"grok-imagine-video"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-imagine-video"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	route, err := modelRepo.GetByProviderUpstream(ctx, account.ProviderWeb, "grok-imagine-video")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "video-retry-after", Prefix: "video-retry-after", SecretHash: strings.Repeat("b", 64),
+		EncryptedSecret: "encrypted", Enabled: true, RPMLimit: 60, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &videoCreateFailoverAdapter{
+		failures: map[uint64]int{credential.ID: 1}, status: http.StatusTooManyRequests, retryAfter: 7 * time.Second,
+	}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(keyRepo, nil, nil, 60, 4, nil), registry, selector, nil, 3)
+	service.ConfigureMedia(mediaRepo, 1)
+	service.UpdateVideoMaxAttempts(1)
+
+	now := time.Now().UTC()
+	job := media.Job{
+		ID: "video_retry_after", RequestID: "request-video-retry-after", ClientKeyID: key.ID, ClientKeyName: key.Name,
+		AccountID: credential.ID, AccountName: credential.Name, Provider: string(account.ProviderWeb),
+		Model: route.PublicID, ModelRouteID: route.ID, UpstreamModel: route.UpstreamModel,
+		Operation: provider.VideoOperationGenerate, Prompt: "test", Seconds: 5, Quality: "720p",
+		Status: media.StatusInProgress, InputJSON: `{}`, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := mediaRepo.CreateMediaJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	beforeCooldown := time.Now().UTC()
+	service.runVideoJob(ctx, job, route)
+	if attempts := adapter.Attempts(); len(attempts) != 1 || attempts[0] != credential.ID {
+		t.Fatalf("Retry-After scenario attempts = %#v, want account %d", attempts, credential.ID)
+	}
+	cooled, err := accountRepo.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cooled.CooldownUntil == nil || cooled.AuthStatus != account.AuthStatusActive {
+		t.Fatalf("video Retry-After did not cool active account: %#v", cooled)
+	}
+	cooldown := cooled.CooldownUntil.Sub(beforeCooldown)
+	if cooldown < 6*time.Second || cooldown > 8*time.Second {
+		t.Fatalf("video Retry-After cooldown = %s, want ~7s", cooldown)
 	}
 }

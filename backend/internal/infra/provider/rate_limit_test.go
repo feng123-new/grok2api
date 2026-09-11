@@ -33,3 +33,12 @@ func TestParseRateLimitMetadataOrdinary429(t *testing.T) {
 		t.Fatalf("ordinary 429 must not parse as team rate limit: %#v", metadata)
 	}
 }
+
+func TestParseRetryAfterHeader(t *testing.T) {
+	if got := ParseRetryAfterHeader("7", time.Now().UTC()); got != 7*time.Second {
+		t.Fatalf("seconds retryAfter = %s, want 7s", got)
+	}
+	if got := ParseRetryAfterHeader("not-a-delay", time.Now().UTC()); got != 0 {
+		t.Fatalf("invalid retryAfter = %s, want 0", got)
+	}
+}

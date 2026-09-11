@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	fhttptest "github.com/bogdanfinn/fhttp/httptest"
@@ -1689,6 +1690,18 @@ func TestParseVideoStreamPreservesUpstreamStatus(t *testing.T) {
 	status, ok := provider.ErrorHTTPStatus(err)
 	if !ok || status != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, ok = %v, err = %v", status, ok, err)
+	}
+}
+
+func TestParseVideoStreamPreservesRetryAfterHeader(t *testing.T) {
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": {"7"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"8","message":"Too many requests"}}`)),
+	}
+	_, _, err := parseVideoStream(response, nil)
+	if got := provider.ErrorRetryAfter(err); got != 7*time.Second {
+		t.Fatalf("retry after = %s, want 7s; err=%v", got, err)
 	}
 }
 

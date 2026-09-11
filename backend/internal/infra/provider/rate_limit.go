@@ -40,7 +40,7 @@ func RateLimitFromResponse(status int, header http.Header, body []byte) *RateLim
 	}
 	if header != nil {
 		if headerValue := header.Get("Retry-After"); headerValue != "" {
-			if retryAfter := parseRetryAfterHeader(headerValue, time.Now().UTC()); retryAfter > 0 {
+			if retryAfter := ParseRetryAfterHeader(headerValue, time.Now().UTC()); retryAfter > 0 {
 				metadata.RetryAfter = retryAfter
 			}
 		} else if metadata.RetryAfter > 0 {
@@ -159,7 +159,9 @@ func rateLimitResetAfter(body string) time.Duration {
 	return total
 }
 
-func parseRetryAfterHeader(value string, now time.Time) time.Duration {
+// ParseRetryAfterHeader parses the standard seconds or HTTP-date form without
+// trusting malformed, past, or non-positive values.
+func ParseRetryAfterHeader(value string, now time.Time) time.Duration {
 	value = strings.TrimSpace(value)
 	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds > 0 {
 		return time.Duration(seconds) * time.Second
