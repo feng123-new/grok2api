@@ -421,8 +421,11 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	updateService := updatecheckapp.NewService(buildinfo.CurrentVersion(), nil)
 
 	startup := newStartupState(len(windows))
+	readyCache := newReadinessCache(readinessCacheTTL)
 	readiness := func(readyCtx context.Context) httpserver.ReadinessSnapshot {
-		return readinessSnapshot(readyCtx, startup, runtimeHealth, modelRepo, accountRepo, providers, auditService)
+		return readyCache.get(readyCtx, func(loadCtx context.Context) httpserver.ReadinessSnapshot {
+			return readinessSnapshot(loadCtx, startup, runtimeHealth, modelRepo, accountRepo, providers, auditService)
+		})
 	}
 	qualityGuardProbe := egressapp.QualityProbeInput{}
 	if cfg.QualityGuard.Enabled {

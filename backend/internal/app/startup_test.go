@@ -13,6 +13,7 @@ import (
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	httpserver "github.com/chenyme/grok2api/backend/internal/transport/http"
 )
 
 func TestReadinessStartupReportDoesNotExposeInternalErrors(t *testing.T) {
@@ -140,5 +141,44 @@ func TestReadinessRestoresPersistedCooldownWithoutUpstreamProbe(t *testing.T) {
 	snapshot := readinessSnapshot(ctx, state, func(context.Context) error { return nil }, models, accounts, provider.NewRegistry(), nil)
 	if snapshot.Ready || snapshot.State != "not_ready" || snapshot.Components["grok_build"].State != "unavailable" {
 		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
+func TestReadinessCacheReusesFreshSnapshot(t *testing.T) {
+	cache := newReadinessCache(time.Minute)
+	calls := 0
+	load := func(context.Context) httpserver.ReadinessSnapshot {
+		calls++
+		return httpserver.ReadinessSnapshot{Ready: true, State: "ready"}
+	}
+
+	first := cache.get(context.Background(), load)
+	second := cache.get(context.Background(), load)
+
+	if calls != 1 {
+		t.Fatalf("loader calls = %d, want 1", calls)
+	}
+	if !first.Ready || !second.Ready || first.State != second.State {
+		t.Fatalf("cached snapshots = %#v and %#v", first, second)
+	}
+}
+
+func TestReadinessCacheRefreshesAfterTTL(t *testing.T) {
+	cache := newReadinessCache(time.Nanosecond)
+	calls := 0
+	load := func(context.Context) httpserver.ReadinessSnapshot {
+		calls++
+		return httpserver.ReadinessSnapshot{Ready: calls%2 == 1, State: "ready"}
+	}
+
+	cache.get(context.Background(), load)
+	time.Sleep(time.Millisecond)
+	second := cache.get(context.Background(), load)
+
+	if calls != 2 {
+		t.Fatalf("loader calls = %d, want 2", calls)
+	}
+	if second.Ready {
+		t.Fatalf("second snapshot = %#v, want refreshed snapshot", second)
 	}
 }

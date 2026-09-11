@@ -29,6 +29,7 @@ const (
 	consoleQuotaCatchupBatch   = 10
 	modelCatalogStaleAfter     = 24 * time.Hour
 	modelCatalogCatchupEvery   = 6 * time.Hour
+	readinessCacheTTL          = time.Second
 )
 
 type startupReport struct {
@@ -52,6 +53,34 @@ type startupState struct {
 	updatedAt time.Time
 	report    startupReport
 	statsig   httpserver.ReadinessComponent
+}
+
+type readinessCache struct {
+	mu        sync.Mutex
+	ttl       time.Duration
+	expiresAt time.Time
+	value     httpserver.ReadinessSnapshot
+	valid     bool
+}
+
+func newReadinessCache(ttl time.Duration) *readinessCache {
+	return &readinessCache{ttl: ttl}
+}
+
+func (c *readinessCache) get(ctx context.Context, load func(context.Context) httpserver.ReadinessSnapshot) httpserver.ReadinessSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.valid && time.Now().Before(c.expiresAt) {
+		return c.value
+	}
+	value := load(ctx)
+	if c.ttl <= 0 {
+		return value
+	}
+	c.value = value
+	c.expiresAt = time.Now().Add(c.ttl)
+	c.valid = true
+	return value
 }
 
 func newStartupState(restoredQuotaRecoveries int) *startupState {
